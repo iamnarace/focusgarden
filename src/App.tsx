@@ -20,10 +20,15 @@ import {
   TimerPreset,
   FocusSessionRecord,
   HabitItem,
+  PersistedTimerState,
   DEFAULT_PRESET,
-  LAST_7_DAYS,
-  DEMO_SESSIONS,
-  DEMO_HABITS,
+  createDemoSessions,
+  createDemoHabits,
+  formatLocalDateKey,
+  getLastNDays,
+  checkDayBoundary,
+  getModeDurationMinutes,
+  reconcileRestoredTimerState,
   computeRemainingSeconds,
   formatCountdown,
   getBotanicalStage,
@@ -33,34 +38,74 @@ import {
 const STORAGE_PRESET_KEY = 'focusgarden_preset_v1';
 const STORAGE_SESSIONS_KEY = 'focusgarden_sessions_v1';
 const STORAGE_HABITS_KEY = 'focusgarden_habits_v1';
-const TODAY_DATE = '2026-10-20';
+export const STORAGE_TIMER_STATE_KEY = 'focusgarden_timer_state_v1';
+
+function loadInitialPreset(): TimerPreset {
+  try {
+    const saved = localStorage.getItem(STORAGE_PRESET_KEY);
+    if (saved) return { ...DEFAULT_PRESET, ...JSON.parse(saved) };
+  } catch {
+    // Fallback
+  }
+  return DEFAULT_PRESET;
+}
+
+function loadSavedTimerState(): Partial<PersistedTimerState> | null {
+  try {
+    const saved = localStorage.getItem(STORAGE_TIMER_STATE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Partial<PersistedTimerState>;
+      }
+    }
+  } catch {
+    // Fallback
+  }
+  return null;
+}
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'sanctuary' | 'habits'>('sanctuary');
 
+  // Dynamic Local Date & 7-Day Window State (updates across midnight & timezone changes)
+  const [todayDate, setTodayDate] = useState<string>(() =>
+    formatLocalDateKey(new Date())
+  );
+  const last7Days = useMemo(() => getLastNDays(7, todayDate), [todayDate]);
+
   // Timer Preset Configuration
-  const [preset, setPreset] = useState<TimerPreset>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_PRESET_KEY);
-      if (saved) return { ...DEFAULT_PRESET, ...JSON.parse(saved) };
-    } catch {
-      // Fallback
-    }
-    return DEFAULT_PRESET;
-  });
+  const [preset, setPreset] = useState<TimerPreset>(loadInitialPreset);
+
+  // Reconcile any persisted timer state at initialization
+  const initialReconciled = useMemo(
+    () => reconcileRestoredTimerState(loadSavedTimerState(), preset, Date.now()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
 
   // Sessions & Habits State
   const [sessions, setSessions] = useState<FocusSessionRecord[]>(() => {
+    let baseSessions: FocusSessionRecord[] | null = null;
     try {
       const saved = localStorage.getItem(STORAGE_SESSIONS_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          baseSessions = parsed;
+        }
       }
     } catch {
       // Fallback
     }
-    return DEMO_SESSIONS;
+    const list = baseSessions ?? createDemoSessions(getLastNDays(7));
+    if (
+      initialReconciled.expiredSession &&
+      !list.some((s) => s.id === initialReconciled.expiredSession?.id)
+    ) {
+      return [initialReconciled.expiredSession, ...list];
+    }
+    return list;
   });
 
   const [habits, setHabits] = useState<HabitItem[]>(() => {
@@ -73,26 +118,37 @@ export function App() {
     } catch {
       // Fallback
     }
-    return DEMO_HABITS;
+    return createDemoHabits(getLastNDays(7));
   });
 
-  // Drift-Free Wall-Clock Timer State
-  const [mode, setMode] = useState<TimerMode>('focus');
-  const [taskLabel, setTaskLabel] = useState<string>(
-    'Deep Work: System Architecture & Code Review'
+  // Drift-Free Wall-Clock Timer State (restored from localStorage when active/paused)
+  const [mode, setMode] = useState<TimerMode>(initialReconciled.mode);
+  const [taskLabel, setTaskLabel] = useState<string>(initialReconciled.taskLabel);
+  const [targetEndTimeMs, setTargetEndTimeMs] = useState<number | null>(
+    initialReconciled.targetEndTimeMs
   );
-  const [targetEndTimeMs, setTargetEndTimeMs] = useState<number | null>(null);
   const [pausedRemainingSec, setPausedRemainingSec] = useState<number>(
-    DEFAULT_PRESET.focusMinutes * 60
+    initialReconciled.pausedRemainingSec
   );
   const [displaySeconds, setDisplaySeconds] = useState<number>(
-    DEFAULT_PRESET.focusMinutes * 60
+    initialReconciled.displaySeconds
+  );
+  const [activeDurationMinutes, setActiveDurationMinutes] = useState<number>(
+    initialReconciled.activeDurationMinutes
   );
 
   // New Habit Form
   const [newHabitTitle, setNewHabitTitle] = useState<string>('');
   const [newHabitCat, setNewHabitCat] = useState<HabitItem['category']>('Deep Work');
-  const [bannerMsg, setBannerMsg] = useState<string | null>(null);
+  const [bannerMsg, setBannerMsg] = useState<string | null>(() => {
+    if (initialReconciled.expiredSession) {
+      return `Completed ${initialReconciled.expiredSession.durationMinutes}-minute focus session on "${initialReconciled.expiredSession.taskLabel}"!`;
+    }
+    if (initialReconciled.expiredBreak) {
+      return 'Break interval complete! Ready for your next focus block.';
+    }
+    return null;
+  });
 
   useEffect(() => {
     try {
@@ -118,6 +174,22 @@ export function App() {
     }
   }, [habits]);
 
+  // Persist active or paused timer state so reloads preserve running sessions
+  useEffect(() => {
+    try {
+      const stateToSave: PersistedTimerState = {
+        mode,
+        taskLabel,
+        targetEndTimeMs,
+        pausedRemainingSec,
+        activeDurationMinutes,
+      };
+      localStorage.setItem(STORAGE_TIMER_STATE_KEY, JSON.stringify(stateToSave));
+    } catch {
+      // Ignore
+    }
+  }, [mode, taskLabel, targetEndTimeMs, pausedRemainingSec, activeDurationMinutes]);
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const tab = params.get('tab');
@@ -125,6 +197,29 @@ export function App() {
       setActiveTab(tab);
     }
   }, []);
+
+  // Day-boundary and time-zone change synchronization
+  useEffect(() => {
+    const syncDayBoundary = () => {
+      const check = checkDayBoundary(todayDate, new Date(Date.now()));
+      if (check.changed) {
+        setTodayDate(check.currentDateKey);
+      }
+    };
+    const intervalId = window.setInterval(syncDayBoundary, 15_000);
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        syncDayBoundary();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    window.addEventListener('focus', syncDayBoundary);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('focus', syncDayBoundary);
+    };
+  }, [todayDate]);
 
   // Wall-clock synchronization effect (handles inactive/throttled tabs accurately)
   useEffect(() => {
@@ -134,34 +229,42 @@ export function App() {
     }
 
     const syncClock = () => {
-      const rem = computeRemainingSeconds(targetEndTimeMs, pausedRemainingSec, Date.now());
+      const nowMs = Date.now();
+      const now = new Date(nowMs);
+      const dayCheck = checkDayBoundary(todayDate, now);
+      if (dayCheck.changed) {
+        setTodayDate(dayCheck.currentDateKey);
+      }
+
+      const rem = computeRemainingSeconds(targetEndTimeMs, pausedRemainingSec, nowMs);
       setDisplaySeconds(rem);
 
       if (rem <= 0) {
-        // Timer finished!
+        // Timer finished! Use actual completion timestamp for date accuracy across midnight
+        const completedTargetMs = targetEndTimeMs;
         setTargetEndTimeMs(null);
-        const modeMinutes =
-          mode === 'focus'
-            ? preset.focusMinutes
-            : mode === 'shortBreak'
-            ? preset.shortBreakMinutes
-            : preset.longBreakMinutes;
+        const modeMinutes = getModeDurationMinutes(mode, preset);
 
         setPausedRemainingSec(modeMinutes * 60);
         setDisplaySeconds(modeMinutes * 60);
+        setActiveDurationMinutes(modeMinutes);
 
         if (mode === 'focus') {
+          const completionDate = new Date(completedTargetMs);
+          const sessionDuration = activeDurationMinutes || modeMinutes;
           const newRecord: FocusSessionRecord = {
-            id: `sess-${Date.now()}`,
-            date: TODAY_DATE,
-            timestampIso: new Date().toISOString(),
+            id: `sess-completed-${completedTargetMs}`,
+            date: formatLocalDateKey(completionDate),
+            timestampIso: completionDate.toISOString(),
             taskLabel: taskLabel.trim() || 'Focused Session',
-            durationMinutes: modeMinutes,
+            durationMinutes: sessionDuration,
             mode: 'focus',
           };
-          setSessions((prev) => [newRecord, ...prev]);
+          setSessions((prev) =>
+            prev.some((s) => s.id === newRecord.id) ? prev : [newRecord, ...prev]
+          );
           setBannerMsg(
-            `Completed ${modeMinutes}-minute focus session on "${newRecord.taskLabel}"!`
+            `Completed ${sessionDuration}-minute focus session on "${newRecord.taskLabel}"!`
           );
         } else {
           setBannerMsg('Break interval complete! Ready for your next focus block.');
@@ -182,24 +285,24 @@ export function App() {
       window.clearInterval(intervalId);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [targetEndTimeMs, pausedRemainingSec, mode, preset, taskLabel]);
+  }, [
+    targetEndTimeMs,
+    pausedRemainingSec,
+    mode,
+    preset,
+    taskLabel,
+    todayDate,
+    activeDurationMinutes,
+  ]);
 
-  const totalModeSeconds =
-    (mode === 'focus'
-      ? preset.focusMinutes
-      : mode === 'shortBreak'
-      ? preset.shortBreakMinutes
-      : preset.longBreakMinutes) * 60;
+  const totalModeSeconds = getModeDurationMinutes(mode, preset) * 60;
 
   const switchMode = (nextMode: TimerMode) => {
     setTargetEndTimeMs(null);
     setMode(nextMode);
-    const secs =
-      (nextMode === 'focus'
-        ? preset.focusMinutes
-        : nextMode === 'shortBreak'
-        ? preset.shortBreakMinutes
-        : preset.longBreakMinutes) * 60;
+    const mins = getModeDurationMinutes(nextMode, preset);
+    const secs = mins * 60;
+    setActiveDurationMinutes(mins);
     setPausedRemainingSec(secs);
     setDisplaySeconds(secs);
   };
@@ -207,6 +310,8 @@ export function App() {
   const handleToggleStartPause = () => {
     if (targetEndTimeMs === null) {
       // Start timer using monotonic wall-clock target timestamp
+      const mins = getModeDurationMinutes(mode, preset);
+      setActiveDurationMinutes(mins);
       setTargetEndTimeMs(Date.now() + pausedRemainingSec * 1000);
     } else {
       // Pause timer and capture exact remaining seconds
@@ -218,17 +323,24 @@ export function App() {
   };
 
   const handleResetTimer = () => {
+    const mins = getModeDurationMinutes(mode, preset);
     setTargetEndTimeMs(null);
-    setPausedRemainingSec(totalModeSeconds);
-    setDisplaySeconds(totalModeSeconds);
+    setActiveDurationMinutes(mins);
+    setPausedRemainingSec(mins * 60);
+    setDisplaySeconds(mins * 60);
   };
 
   const handleLogQuickSession = () => {
+    const now = new Date();
+    const currentDayKey = formatLocalDateKey(now);
+    if (currentDayKey !== todayDate) {
+      setTodayDate(currentDayKey);
+    }
     const mins = preset.focusMinutes;
     const record: FocusSessionRecord = {
-      id: `sess-${Date.now()}`,
-      date: TODAY_DATE,
-      timestampIso: new Date().toISOString(),
+      id: `sess-${now.getTime()}`,
+      date: currentDayKey,
+      timestampIso: now.toISOString(),
       taskLabel: taskLabel.trim() || 'Deep Work Session',
       durationMinutes: mins,
       mode: 'focus',
@@ -255,11 +367,15 @@ export function App() {
   const handleAddHabit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newHabitTitle.trim()) return;
+    const currentDayKey = formatLocalDateKey(new Date());
+    if (currentDayKey !== todayDate) {
+      setTodayDate(currentDayKey);
+    }
     const item: HabitItem = {
       id: `hab-${Date.now()}`,
       title: newHabitTitle.trim(),
       category: newHabitCat,
-      completedDates: [TODAY_DATE],
+      completedDates: [currentDayKey],
     };
     setHabits((prev) => [...prev, item]);
     setNewHabitTitle('');
@@ -271,10 +387,15 @@ export function App() {
   };
 
   const handleResetDemoWorkspace = () => {
+    const freshToday = formatLocalDateKey(new Date());
+    const fresh7Days = getLastNDays(7, freshToday);
+    setTodayDate(freshToday);
     setTargetEndTimeMs(null);
+    setMode('focus');
     setPreset(DEFAULT_PRESET);
-    setSessions(DEMO_SESSIONS);
-    setHabits(DEMO_HABITS);
+    setSessions(createDemoSessions(fresh7Days));
+    setHabits(createDemoHabits(fresh7Days));
+    setActiveDurationMinutes(DEFAULT_PRESET.focusMinutes);
     setPausedRemainingSec(DEFAULT_PRESET.focusMinutes * 60);
     setDisplaySeconds(DEFAULT_PRESET.focusMinutes * 60);
     setBannerMsg('Restored demonstration focus history and 7-day habit streaks.');
@@ -284,9 +405,9 @@ export function App() {
   const todayMinutes = useMemo(
     () =>
       sessions
-        .filter((s) => s.date === TODAY_DATE && s.mode === 'focus')
+        .filter((s) => s.date === todayDate && s.mode === 'focus')
         .reduce((acc, s) => acc + s.durationMinutes, 0),
-    [sessions]
+    [sessions, todayDate]
   );
 
   const botanical = useMemo(
@@ -295,7 +416,7 @@ export function App() {
   );
 
   const weeklyChartData = useMemo(() => {
-    return LAST_7_DAYS.map((dateStr) => {
+    return last7Days.map((dateStr) => {
       const totalMins = sessions
         .filter((s) => s.date === dateStr && s.mode === 'focus')
         .reduce((acc, s) => acc + s.durationMinutes, 0);
@@ -306,7 +427,7 @@ export function App() {
         minutes: totalMins,
       };
     });
-  }, [sessions]);
+  }, [sessions, last7Days]);
 
   const maxChartMins = Math.max(
     preset.dailyGoalMinutes,
@@ -573,12 +694,15 @@ export function App() {
                     min={1}
                     max={60}
                     value={preset.shortBreakMinutes}
-                    onChange={(e) =>
-                      setPreset((p) => ({
-                        ...p,
-                        shortBreakMinutes: Math.max(1, Number(e.target.value) || 5),
-                      }))
-                    }
+                    onChange={(e) => {
+                      const val = Math.max(1, Number(e.target.value) || 5);
+                      setPreset((p) => ({ ...p, shortBreakMinutes: val }));
+                      if (mode === 'shortBreak' && targetEndTimeMs === null) {
+                        setActiveDurationMinutes(val);
+                        setPausedRemainingSec(val * 60);
+                        setDisplaySeconds(val * 60);
+                      }
+                    }}
                     className="w-full px-2.5 py-1.5 rounded-lg border border-stone-300 font-mono"
                   />
                 </div>
@@ -592,12 +716,15 @@ export function App() {
                     min={5}
                     max={60}
                     value={preset.longBreakMinutes}
-                    onChange={(e) =>
-                      setPreset((p) => ({
-                        ...p,
-                        longBreakMinutes: Math.max(5, Number(e.target.value) || 15),
-                      }))
-                    }
+                    onChange={(e) => {
+                      const val = Math.max(5, Number(e.target.value) || 15);
+                      setPreset((p) => ({ ...p, longBreakMinutes: val }));
+                      if (mode === 'longBreak' && targetEndTimeMs === null) {
+                        setActiveDurationMinutes(val);
+                        setPausedRemainingSec(val * 60);
+                        setDisplaySeconds(val * 60);
+                      }
+                    }}
                     className="w-full px-2.5 py-1.5 rounded-lg border border-stone-300 font-mono"
                   />
                 </div>
@@ -637,7 +764,7 @@ export function App() {
                       Daily Botanical Growth
                     </h2>
                     <p className="text-xs text-stone-500">
-                      Today ({TODAY_DATE}): {todayMinutes} / {preset.dailyGoalMinutes} mins
+                      Today ({todayDate}): {todayMinutes} / {preset.dailyGoalMinutes} mins
                     </p>
                   </div>
                   <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-900 border border-emerald-200">
@@ -834,7 +961,7 @@ export function App() {
                   <thead>
                     <tr className="border-b border-stone-200 text-[11px] font-mono uppercase text-stone-400">
                       <th className="py-2.5 px-3">Daily Habit</th>
-                      {LAST_7_DAYS.map((d) => (
+                      {last7Days.map((d) => (
                         <th key={d} className="py-2.5 px-2 text-center">
                           {d.slice(5)}
                         </th>
@@ -845,7 +972,7 @@ export function App() {
                   </thead>
                   <tbody className="divide-y divide-stone-100 text-xs">
                     {habits.map((habit) => {
-                      const streak = calculateHabitStreak(habit.completedDates, LAST_7_DAYS);
+                      const streak = calculateHabitStreak(habit.completedDates, last7Days);
                       return (
                         <tr key={habit.id} className="hover:bg-stone-50/80">
                           <td className="py-3 px-3">
@@ -854,7 +981,7 @@ export function App() {
                               {habit.category}
                             </span>
                           </td>
-                          {LAST_7_DAYS.map((dateStr) => {
+                          {last7Days.map((dateStr) => {
                             const done = habit.completedDates.includes(dateStr);
                             return (
                               <td key={dateStr} className="py-3 px-2 text-center">
