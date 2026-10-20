@@ -311,7 +311,9 @@ export function App() {
     if (targetEndTimeMs === null) {
       // Start timer using monotonic wall-clock target timestamp
       const mins = getModeDurationMinutes(mode, preset);
-      setActiveDurationMinutes(mins);
+      if (pausedRemainingSec === mins * 60 || !activeDurationMinutes) {
+        setActiveDurationMinutes(mins);
+      }
       setTargetEndTimeMs(Date.now() + pausedRemainingSec * 1000);
     } else {
       // Pause timer and capture exact remaining seconds
