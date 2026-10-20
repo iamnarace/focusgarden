@@ -112,6 +112,28 @@ describe('FocusGarden Wall-Clock Timer & Habit Engine Tests', () => {
     // Multi-week streak extending beyond the 7-day display window
     const tenDayDates = getLastNDays(10, '2026-10-19');
     expect(calculateHabitStreak(tenDayDates, refWindow)).toBe(10);
+
+    // Year-boundary streak (Dec 29, 2025 -> Jan 2, 2026)
+    const janWindow = getLastNDays(7, '2026-01-03');
+    expect(
+      calculateHabitStreak(
+        ['2025-12-29', '2025-12-30', '2025-12-31', '2026-01-01', '2026-01-02'],
+        janWindow
+      )
+    ).toBe(5);
+
+    // Missing day in the middle breaks the consecutive streak at the gap
+    expect(
+      calculateHabitStreak(
+        ['2025-12-29', '2025-12-31', '2026-01-01', '2026-01-02'],
+        janWindow
+      )
+    ).toBe(3);
+
+    // Daylight Saving Time (DST) spring-forward / fall-back window never duplicates or skips a calendar date
+    const dstWindow = getLastNDays(7, new Date(2026, 3, 7, 0, 15, 0));
+    expect(new Set(dstWindow).size).toBe(7);
+    expect(dstWindow[6]).toBe('2026-04-07');
   });
 
   it('reconciles persisted active and expired timers across reloads and midnight boundaries', () => {
@@ -199,6 +221,11 @@ describe('FocusGarden Wall-Clock Timer & Habit Engine Tests', () => {
       screen.getByText(/Completed 25-minute focus session on "Reloaded Expired Block"!/i)
     ).toBeInTheDocument();
     expect(screen.getByTestId('timer-readout')).toHaveTextContent('25:00');
+
+    // Verify the completed session was recorded once and persisted timer target was cleared so re-renders do not duplicate it
+    const savedStateAfter = JSON.parse(localStorage.getItem(STORAGE_TIMER_STATE_KEY) || '{}');
+    expect(savedStateAfter.targetEndTimeMs).toBeNull();
+    expect(screen.getAllByText('Reloaded Expired Block')).toHaveLength(1);
   });
 
   it('renders FocusGarden UI, logs a completed block, and switches to Habit Tracker', () => {

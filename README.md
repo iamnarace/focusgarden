@@ -48,13 +48,13 @@ Many web-based Pomodoro timers rely on naive `setInterval(() => seconds--, 1000)
 - **Styling:** Tailwind CSS (Warm Sage, Moss & Terracotta botanical palette)
 - **Graphics:** Custom SVG circular progress dial, botanical growth artwork, and 7-day bar chart
 - **Icons:** Lucide React
-- **Build & Test:** Vite 5, Vitest, React Testing Library, ESLint
+- **Build & Test:** Vite 6, Vitest 4, React Testing Library, ESLint
 
 ---
 
 ## Requirements & Installation
 
-- **Node.js:** v18.18+ or v20+
+- **Node.js:** v20+ LTS recommended (v18.18+ supported for build/runtime)
 - **npm:** v9+
 
 ```bash
